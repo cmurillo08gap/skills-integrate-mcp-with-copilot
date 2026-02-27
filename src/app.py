@@ -5,14 +5,20 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 import os
+import json
+import secrets
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+security = HTTPBearer(auto_error=False)
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -78,6 +84,47 @@ activities = {
 }
 
 
+teachers_file = current_dir / "teachers.json"
+
+
+def load_teacher_credentials():
+    if not teachers_file.exists():
+        return {}
+
+    with teachers_file.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    return data.get("teachers", {})
+
+
+teacher_credentials = load_teacher_credentials()
+active_sessions = {}
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def require_admin(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    if not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Teacher login required"
+        )
+
+    token = credentials.credentials
+    username = active_sessions.get(token)
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session"
+        )
+
+    return username
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,8 +135,50 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(payload: LoginRequest):
+    stored_password = teacher_credentials.get(payload.username)
+    if not stored_password or stored_password != payload.password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password"
+        )
+
+    token = secrets.token_urlsafe(32)
+    active_sessions[token] = payload.username
+
+    return {
+        "token": token,
+        "username": payload.username,
+        "role": "admin"
+    }
+
+
+@app.post("/auth/logout")
+def logout(admin_username: str = Depends(require_admin), credentials: HTTPAuthorizationCredentials = Depends(security)):
+    active_sessions.pop(credentials.credentials, None)
+    return {"message": f"Logged out {admin_username}"}
+
+
+@app.get("/auth/session")
+def get_session(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials or credentials.scheme.lower() != "bearer":
+        return {"authenticated": False}
+
+    token = credentials.credentials
+    username = active_sessions.get(token)
+    if not username:
+        return {"authenticated": False}
+
+    return {
+        "authenticated": True,
+        "username": username,
+        "role": "admin"
+    }
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, admin_username: str = Depends(require_admin)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -107,11 +196,11 @@ def signup_for_activity(activity_name: str, email: str):
 
     # Add student
     activity["participants"].append(email)
-    return {"message": f"Signed up {email} for {activity_name}"}
+    return {"message": f"{admin_username} signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, admin_username: str = Depends(require_admin)):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -129,4 +218,4 @@ def unregister_from_activity(activity_name: str, email: str):
 
     # Remove student
     activity["participants"].remove(email)
-    return {"message": f"Unregistered {email} from {activity_name}"}
+    return {"message": f"{admin_username} unregistered {email} from {activity_name}"}
